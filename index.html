@@ -1,0 +1,607 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Zen Mowing - Ramadan Hilal</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      background: #111;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      min-height: 100vh;
+      overflow: hidden;
+    }
+    canvas {
+      max-height: 100vh;
+      max-width: 100vw;
+      image-rendering: pixelated;
+      image-rendering: crisp-edges;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="game" width="1080" height="1920"></canvas>
+  <script>
+  (() => {
+    const canvas = document.getElementById('game');
+    const ctx = canvas.getContext('2d');
+    ctx.imageSmoothingEnabled = false;
+
+    // ====== CONFIG ======
+    const SRC = 16;             // source tile size for terrain
+    const TILE = 40;            // display tile size
+    const COLS = 27;
+    const ROWS = 48;
+    const CUT_W = 2;            // rows cut per horizontal pass
+    const DURATION = 70;        // seconds (20% slower)
+
+    // Exterior.png tile positions (17 cols, 16px tiles)
+    const EXT_COLS = 17;
+    // Grass fill tile: TMX tile 1065 → exterior index 308 → row 18, col 2
+    // This is the ONLY solid fill grass tile - neighbors are edge/border tiles!
+    const GRASS_FILL = { r: 18, c: 2 };
+    // Cut lawn uses the same green grass base (NOT dirt!)
+
+    // Single-tile tall grass decorations from exterior.png (TMX Grass_top_details layer)
+    // These are scattered randomly on top of the grass field
+    const TALL_GRASS_TILES = [
+      { r: 54, c: 1 },  // 1676
+      { r: 54, c: 2 },  // 1677
+      { r: 54, c: 3 },  // 1678
+      { r: 54, c: 4 },  // 1679
+      { r: 54, c: 6 },  // 1681
+      { r: 54, c: 7 },  // 1682
+      { r: 54, c: 8 },  // 1683
+      { r: 54, c: 10 }, // 1685
+      { r: 54, c: 11 }, // 1686
+      { r: 54, c: 12 }, // 1687
+      { r: 55, c: 1 },  // 1693
+      { r: 55, c: 2 },  // 1694
+      { r: 55, c: 3 },  // 1695
+      { r: 55, c: 4 },  // 1696
+      { r: 55, c: 6 },  // 1698
+      { r: 55, c: 8 },  // 1700
+      { r: 55, c: 9 },  // 1701
+      { r: 52, c: 13 }, // 1654
+    ];
+
+    // Green leaf details from ground_grass_details.png (rows 10-16, green leaves)
+    // Used for subtle cut-grass texture
+    const GREEN_LEAF_SPOTS = [
+      { r: 10, c: 0 },  { r: 10, c: 4 },  { r: 10, c: 8 },  { r: 10, c: 12 }, { r: 10, c: 16 },
+      { r: 11, c: 0 },  { r: 11, c: 4 },  { r: 11, c: 8 },  { r: 11, c: 12 }, { r: 11, c: 16 },
+      { r: 12, c: 0 },  { r: 12, c: 4 },  { r: 12, c: 8 },  { r: 12, c: 12 },
+      { r: 13, c: 0 },  { r: 13, c: 4 },  { r: 13, c: 8 },
+    ];
+
+    // Vehicle sprite: 32px tile units, 2x3 tiles per frame = 64x96
+    const VEH_TILE = 32;
+    const VEH_FW = 64;   // frame width
+    const VEH_FH = 96;   // frame height
+    // Direction mapping: 0=NW,1=W,2=SW,3=S,4=SE,5=E,6=NE,7=N
+    const DIR_MAP = { right: 5, left: 1, down: 3, up: 7 };
+    const VEH_SCALE = 2.2;
+
+    // Ground grass details: 21 cols, 16px tiles, rows 10-16 are green leaves
+    const GGD_COLS = 21;
+
+    // ====== ASSETS ======
+    const exteriorImg = new Image();
+    exteriorImg.src = 'main-characters-home-free-top-down-pixel-art-asset/Tiled_files/exterior.png';
+    const grassDetailImg = new Image();
+    grassDetailImg.src = 'main-characters-home-free-top-down-pixel-art-asset/Tiled_files/ground_grass_details.png';
+    const vehicleImg = new Image();
+    vehicleImg.src = 'art_entry/vehicle_all.png';
+
+    let loaded = 0;
+    const onLoad = () => { loaded++; if (loaded >= 3) init(); };
+    exteriorImg.onload = onLoad;
+    grassDetailImg.onload = onLoad;
+    vehicleImg.onload = onLoad;
+    exteriorImg.onerror = onLoad;
+    grassDetailImg.onerror = onLoad;
+    vehicleImg.onerror = onLoad;
+
+    // ====== DETERMINISTIC RANDOM ======
+    function hash(a, b) {
+      let h = (Math.imul(a | 0, 2654435761) ^ Math.imul(b | 0, 2246822519)) >>> 0;
+      h = Math.imul((h >> 16) ^ h, 0x45d9f3b) >>> 0;
+      h = Math.imul((h >> 16) ^ h, 0x45d9f3b) >>> 0;
+      return ((h >> 16) ^ h) >>> 0;
+    }
+    function rand(a, b) { return (hash(a, b) & 0xffff) / 0xffff; }
+
+    let _seed = 42;
+    function srand() {
+      _seed = (_seed * 16807) % 2147483647;
+      return (_seed - 1) / 2147483646;
+    }
+
+    // ====== CRESCENT MOON SHAPE ======
+    const shapeMap = [];
+
+    function buildShape() {
+      const cx = COLS / 2;       // center horizontally
+      const cy = ROWS / 2;      // center vertically
+      const outerR = 15;         // outer circle radius
+      const innerR = 12;         // inner circle radius
+      const innerOX = 6;         // inner circle X offset (shifts right = bigger opening)
+      const innerOY = -1;        // slight upward offset
+
+      for (let r = 0; r < ROWS; r++) {
+        shapeMap[r] = [];
+        for (let c = 0; c < COLS; c++) {
+          const dx = c - cx;
+          const dy = r - cy;
+          const distOuter = Math.sqrt(dx * dx + dy * dy);
+          const dxI = c - (cx + innerOX);
+          const dyI = r - (cy + innerOY);
+          const distInner = Math.sqrt(dxI * dxI + dyI * dyI);
+          shapeMap[r][c] = distOuter <= outerR && distInner > innerR;
+        }
+      }
+    }
+
+    // ====== TALL GRASS DECORATION MAP ======
+    const tallGrassMap = [];
+    function buildDecor() {
+      _seed = 42;
+      for (let r = 0; r < ROWS; r++) {
+        tallGrassMap[r] = [];
+        for (let c = 0; c < COLS; c++) {
+          if (srand() < 0.25) {
+            // Pick a random tall grass sprite from exterior.png
+            const idx = Math.floor(srand() * TALL_GRASS_TILES.length);
+            tallGrassMap[r][c] = TALL_GRASS_TILES[idx];
+          } else {
+            tallGrassMap[r][c] = null;
+          }
+        }
+      }
+    }
+
+    // ====== PRE-RENDERED LAYERS ======
+    const bgCvs = document.createElement('canvas');
+    bgCvs.width = 1080; bgCvs.height = 1920;
+    const bgCtx = bgCvs.getContext('2d');
+
+    const cutCvs = document.createElement('canvas');
+    cutCvs.width = 1080; cutCvs.height = 1920;
+    const cutCtx = cutCvs.getContext('2d');
+
+    function prerenderBackground() {
+      bgCtx.imageSmoothingEnabled = false;
+
+      for (let r = 0; r < ROWS; r++) {
+        for (let c = 0; c < COLS; c++) {
+          const x = c * TILE;
+          const y = r * TILE;
+
+          // Draw grass base fill tile from exterior.png
+          if (exteriorImg.complete && exteriorImg.naturalWidth) {
+            bgCtx.drawImage(
+              exteriorImg,
+              GRASS_FILL.c * SRC, GRASS_FILL.r * SRC, SRC, SRC,
+              x, y, TILE, TILE
+            );
+          } else {
+            bgCtx.fillStyle = '#3a6832';
+            bgCtx.fillRect(x, y, TILE, TILE);
+          }
+
+          // Darken uncut grass slightly to create wild/overgrown look
+          bgCtx.fillStyle = 'rgba(20,50,10,0.20)';
+          bgCtx.fillRect(x, y, TILE, TILE);
+
+          // Add green leaf texture from ground_grass_details.png for grass body
+          if (grassDetailImg.complete && grassDetailImg.naturalWidth && rand(c * 7, r * 13) < 0.4) {
+            const leafIdx = hash(c * 3, r * 7) % GREEN_LEAF_SPOTS.length;
+            const leaf = GREEN_LEAF_SPOTS[leafIdx];
+            bgCtx.drawImage(
+              grassDetailImg,
+              leaf.c * SRC, leaf.r * SRC, SRC, SRC,
+              x, y, TILE, TILE
+            );
+          }
+
+          // Overlay random tall grass decorations from exterior.png
+          const tg = tallGrassMap[r]?.[c];
+          if (tg && exteriorImg.complete && exteriorImg.naturalWidth) {
+            bgCtx.drawImage(
+              exteriorImg,
+              tg.c * SRC, tg.r * SRC, SRC, SRC,
+              x, y, TILE, TILE
+            );
+          }
+        }
+      }
+    }
+
+    function drawCutTile(c, r) {
+      cutCtx.imageSmoothingEnabled = false;
+      const x = c * TILE;
+      const y = r * TILE;
+
+      // Draw green grass base from exterior.png (same tile as uncut, but lighter)
+      if (exteriorImg.complete && exteriorImg.naturalWidth) {
+        cutCtx.drawImage(
+          exteriorImg,
+          GRASS_FILL.c * SRC, GRASS_FILL.r * SRC, SRC, SRC,
+          x, y, TILE, TILE
+        );
+      } else {
+        cutCtx.fillStyle = '#7ec850';
+        cutCtx.fillRect(x, y, TILE, TILE);
+      }
+
+      // Lighten the cut grass to differentiate from uncut
+      cutCtx.fillStyle = 'rgba(180,230,120,0.25)';
+      cutCtx.fillRect(x, y, TILE, TILE);
+
+      // Lawn stripe tint (alternating lighter/darker bands)
+      const stripe = Math.floor(r / CUT_W);
+      cutCtx.fillStyle = stripe % 2 === 0
+        ? 'rgba(160,235,100,0.15)' : 'rgba(90,170,50,0.10)';
+      cutCtx.fillRect(x, y, TILE, TILE);
+
+      // Sparse green leaf details on cut grass
+      if (grassDetailImg.complete && grassDetailImg.naturalWidth && rand(c * 17, r * 31) < 0.12) {
+        const spotIdx = hash(c * 5, r * 11) % GREEN_LEAF_SPOTS.length;
+        const spot = GREEN_LEAF_SPOTS[spotIdx];
+        cutCtx.drawImage(
+          grassDetailImg,
+          spot.c * SRC, spot.r * SRC, SRC, SRC,
+          x, y, TILE, TILE
+        );
+      }
+    }
+
+    // ====== MOWING PATH ======
+    // S-pattern within the crescent+star shape bounds
+    const path = [];
+
+    function buildPath() {
+      // Find vertical range of the shape
+      let minR = ROWS, maxR = 0;
+      for (let r = 0; r < ROWS; r++) {
+        for (let c = 0; c < COLS; c++) {
+          if (shapeMap[r][c]) {
+            minR = Math.min(minR, r);
+            maxR = Math.max(maxR, r);
+          }
+        }
+      }
+
+      // Build S-pattern within shape bounds, CUT_W rows at a time
+      let goRight = true;
+      for (let baseR = minR; baseR <= maxR; baseR += CUT_W) {
+        // Find horizontal extent of shape for this row band
+        let bandMinC = COLS, bandMaxC = 0;
+        for (let dr = 0; dr < CUT_W; dr++) {
+          const rr = baseR + dr;
+          if (rr >= ROWS) break;
+          for (let c = 0; c < COLS; c++) {
+            if (shapeMap[rr][c]) {
+              bandMinC = Math.min(bandMinC, c);
+              bandMaxC = Math.max(bandMaxC, c);
+            }
+          }
+        }
+
+        if (bandMinC > bandMaxC) continue; // no shape tiles in this band
+
+        // Horizontal pass
+        if (goRight) {
+          for (let c = bandMinC; c <= bandMaxC; c++) {
+            path.push({ c, r: baseR });
+          }
+        } else {
+          for (let c = bandMaxC; c >= bandMinC; c--) {
+            path.push({ c, r: baseR });
+          }
+        }
+
+        // Vertical transition to next band
+        const nextBaseR = baseR + CUT_W;
+        if (nextBaseR <= maxR) {
+          const edgeC = goRight ? bandMaxC : bandMinC;
+          // Find next band's edge to connect to
+          let nextBandMinC = COLS, nextBandMaxC = 0;
+          for (let dr = 0; dr < CUT_W; dr++) {
+            const rr = nextBaseR + dr;
+            if (rr >= ROWS) break;
+            for (let c = 0; c < COLS; c++) {
+              if (shapeMap[rr][c]) {
+                nextBandMinC = Math.min(nextBandMinC, c);
+                nextBandMaxC = Math.max(nextBandMaxC, c);
+              }
+            }
+          }
+          const nextEdgeC = goRight ? nextBandMaxC : nextBandMinC;
+
+          // Move down
+          for (let dr = 1; dr <= CUT_W; dr++) {
+            if (baseR + dr <= maxR) {
+              path.push({ c: edgeC, r: baseR + dr });
+            }
+          }
+          // Move horizontally to align with next band edge if needed
+          if (edgeC !== nextEdgeC) {
+            const step = nextEdgeC > edgeC ? 1 : -1;
+            for (let cc = edgeC + step; cc !== nextEdgeC + step; cc += step) {
+              path.push({ c: cc, r: nextBaseR });
+            }
+          }
+        }
+
+        goRight = !goRight;
+      }
+    }
+
+    // ====== TILE STATE ======
+    const cutMap = [];
+    function initCutMap() {
+      for (let r = 0; r < ROWS; r++) {
+        cutMap[r] = new Uint8Array(COLS);
+      }
+    }
+
+    // ====== PARTICLES ======
+    const particles = [];
+
+    function spawnParticles(px, py) {
+      for (let i = 0; i < 3; i++) {
+        particles.push({
+          x: px + srand() * TILE,
+          y: py + srand() * TILE * 0.5,
+          vx: (srand() - 0.5) * 3,
+          vy: -srand() * 3 - 1,
+          life: 0.3 + srand() * 0.3,
+          size: 2 + srand() * 4,
+          color: srand() > 0.5 ? '#5a9e3e' : '#3d7a2a'
+        });
+      }
+    }
+
+    function updateParticles(dt) {
+      for (let i = particles.length - 1; i >= 0; i--) {
+        const p = particles[i];
+        p.x += p.vx;
+        p.y += p.vy;
+        p.vy += 6 * dt;
+        p.life -= dt;
+        if (p.life <= 0) particles.splice(i, 1);
+      }
+    }
+
+    function drawParticles() {
+      for (const p of particles) {
+        ctx.globalAlpha = Math.max(0, Math.min(1, p.life * 2.5));
+        ctx.fillStyle = p.color;
+        ctx.fillRect(p.x, p.y, p.size, p.size);
+      }
+      ctx.globalAlpha = 1;
+    }
+
+    // ====== MOWER STATE ======
+    let pathIdx = 0;
+    let subStep = 0;
+    let mowerX = 0, mowerY = 0;
+    let mowerDir = 'right';
+    let mowerPhase = 0;
+    let phaseTimer = 0;
+    let done = false;
+    let started = false;
+
+    // ====== SUNSET OVERLAY ======
+    const sunsetCvs = document.createElement('canvas');
+    sunsetCvs.width = 1080; sunsetCvs.height = 1920;
+    function prerenderSunset() {
+      const sc = sunsetCvs.getContext('2d');
+      // Warm gradient from top (golden sky glow) to bottom (deeper amber)
+      const g = sc.createLinearGradient(0, 0, 0, 1920);
+      g.addColorStop(0, 'rgba(255,160,60,0.22)');
+      g.addColorStop(0.3, 'rgba(255,130,50,0.18)');
+      g.addColorStop(0.7, 'rgba(200,100,40,0.14)');
+      g.addColorStop(1, 'rgba(160,70,30,0.20)');
+      sc.fillStyle = g;
+      sc.fillRect(0, 0, 1080, 1920);
+    }
+
+    // ====== VIGNETTE ======
+    const vigCvs = document.createElement('canvas');
+    vigCvs.width = 1080; vigCvs.height = 1920;
+    function prerenderVignette() {
+      const vc = vigCvs.getContext('2d');
+      // Warm-tinted vignette for sunset feel
+      const g = vc.createRadialGradient(540, 960, 350, 540, 960, 1100);
+      g.addColorStop(0, 'rgba(0,0,0,0)');
+      g.addColorStop(0.7, 'rgba(40,15,5,0.15)');
+      g.addColorStop(1, 'rgba(30,10,0,0.4)');
+      vc.fillStyle = g;
+      vc.fillRect(0, 0, 1080, 1920);
+    }
+
+    // ====== UPDATE ======
+    function update(dt) {
+      if (!started) return;
+
+      // Animate vehicle phase
+      phaseTimer += dt;
+      if (phaseTimer > 0.1) {
+        phaseTimer -= 0.1;
+        mowerPhase = (mowerPhase + 1) % 8;
+      }
+
+      if (done) return;
+
+      const speed = path.length / DURATION;
+      subStep += speed * dt;
+
+      while (subStep >= 1 && pathIdx < path.length) {
+        subStep -= 1;
+        const pos = path[pathIdx];
+
+        // Cut tiles in the mower's band
+        for (let dr = 0; dr < CUT_W; dr++) {
+          const row = pos.r + dr;
+          if (row >= 0 && row < ROWS && pos.c >= 0 && pos.c < COLS) {
+            if (!cutMap[row][pos.c] && shapeMap[row][pos.c]) {
+              cutMap[row][pos.c] = 1;
+              drawCutTile(pos.c, row);
+              if (srand() > 0.5) {
+                spawnParticles(pos.c * TILE, row * TILE);
+              }
+            }
+          }
+        }
+
+        pathIdx++;
+      }
+
+      // Direction
+      if (pathIdx < path.length - 1) {
+        const cur = path[pathIdx];
+        const nxt = path[Math.min(pathIdx + 1, path.length - 1)];
+        if (nxt.c > cur.c) mowerDir = 'right';
+        else if (nxt.c < cur.c) mowerDir = 'left';
+        else if (nxt.r > cur.r) mowerDir = 'down';
+        else if (nxt.r < cur.r) mowerDir = 'up';
+      }
+
+      // Interpolate position
+      if (pathIdx < path.length - 1) {
+        const cur = path[pathIdx];
+        const nxt = path[pathIdx + 1];
+        const t = Math.min(subStep, 1);
+        mowerX = (cur.c + (nxt.c - cur.c) * t) * TILE;
+        mowerY = (cur.r + (nxt.r - cur.r) * t) * TILE;
+      } else if (pathIdx >= path.length) {
+        // Complete - cut any remaining shape tiles
+        for (let r = 0; r < ROWS; r++) {
+          for (let c = 0; c < COLS; c++) {
+            if (!cutMap[r][c] && shapeMap[r][c]) {
+              cutMap[r][c] = 1;
+              drawCutTile(c, r);
+            }
+          }
+        }
+        const last = path[path.length - 1];
+        mowerX = last.c * TILE;
+        mowerY = last.r * TILE;
+        done = true;
+      }
+
+      updateParticles(dt);
+    }
+
+    // ====== RENDER ======
+    function render() {
+      // Layer 1: tall grass background (pre-rendered)
+      ctx.drawImage(bgCvs, 0, 0);
+
+      // Layer 2: cut tiles overlay
+      ctx.drawImage(cutCvs, 0, 0);
+
+      // Layer 3: particles
+      drawParticles();
+
+      // Layer 4: vehicle sprite with drop shadow
+      if (vehicleImg.complete && vehicleImg.naturalWidth) {
+        const dir = DIR_MAP[mowerDir];
+        const phase = mowerPhase;
+        const ddir = 0; // straight movement
+        const srcX = (phase + 8 * ddir) * VEH_FW;
+        const srcY = dir * VEH_FH;
+        const drawW = VEH_FW * VEH_SCALE;
+        const drawH = VEH_FH * VEH_SCALE;
+        // Center vehicle on mower position
+        const ox = mowerX + TILE * 0.5 - drawW / 2;
+        const oy = mowerY + TILE * CUT_W * 0.5 - drawH / 2 - 10;
+
+        // Drop shadow
+        ctx.save();
+        ctx.shadowColor = 'rgba(0, 0, 0, 0.5)';
+        ctx.shadowBlur = 16;
+        ctx.shadowOffsetX = 5;
+        ctx.shadowOffsetY = 8;
+        ctx.drawImage(
+          vehicleImg,
+          srcX, srcY, VEH_FW, VEH_FH,
+          ox, oy, drawW, drawH
+        );
+        ctx.restore();
+
+        // Crisp sprite on top
+        ctx.drawImage(
+          vehicleImg,
+          srcX, srcY, VEH_FW, VEH_FH,
+          ox, oy, drawW, drawH
+        );
+      }
+
+      // Layer 5: sunset warm overlay
+      ctx.drawImage(sunsetCvs, 0, 0);
+
+      // Layer 6: vignette
+      ctx.drawImage(vigCvs, 0, 0);
+    }
+
+    // ====== GAME LOOP ======
+    let lastT = 0;
+    function loop(ts) {
+      if (!lastT) lastT = ts;
+      const dt = Math.min((ts - lastT) / 1000, 0.05);
+      lastT = ts;
+
+      update(dt);
+      render();
+      requestAnimationFrame(loop);
+    }
+
+    // ====== AUDIO ======
+    const mowerAudio = document.createElement('video');
+    mowerAudio.src = 'meme.mov';
+    mowerAudio.loop = true;
+    mowerAudio.playsInline = true;
+    mowerAudio.style.display = 'none';
+    document.body.appendChild(mowerAudio);
+
+    function startAudio() {
+      mowerAudio.play().catch(() => {});
+      canvas.removeEventListener('click', startAudio);
+      document.removeEventListener('keydown', startAudio);
+    }
+    // Autoplay requires user gesture in most browsers
+    canvas.addEventListener('click', startAudio);
+    document.addEventListener('keydown', startAudio);
+
+    // ====== INIT ======
+    function init() {
+      buildShape();
+      buildDecor();
+      initCutMap();
+      buildPath();
+      prerenderBackground();
+      prerenderSunset();
+      prerenderVignette();
+      cutCtx.clearRect(0, 0, 1080, 1920);
+
+      if (path.length > 0) {
+        mowerX = path[0].c * TILE;
+        mowerY = path[0].r * TILE;
+        mowerDir = 'right';
+      }
+
+      // Try autoplay, fall back to click-to-start
+      mowerAudio.play().catch(() => {});
+
+      requestAnimationFrame(loop);
+    }
+  })();
+  </script>
+</body>
+</html>
